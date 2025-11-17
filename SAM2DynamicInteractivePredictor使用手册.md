@@ -2497,6 +2497,693 @@ predictor(
 
 ---
 
+## 架構設計與 SAM2 整合
+
+### 系統架構概覽
+
+SAM2DynamicInteractivePredictor 是建立在 SAM2 (Segment Anything Model 2) 基礎上的高級預測器，通過添加動態記憶體管理和多物件追蹤功能，擴展了原始 SAM2 的能力。
+
+#### 類繼承結構
+
+```mermaid
+classDiagram
+    class BasePredictor {
+        <<Ultralytics Base>>
+        +setup_model()
+        +preprocess()
+        +postprocess()
+        +__call__()
+    }
+
+    class Predictor {
+        <<SAM Base>>
+        +get_model()
+        +prompt_inference()
+        +_prepare_prompts()
+        +get_im_features()
+    }
+
+    class SAM2Predictor {
+        +set_image()
+        +_inference_features()
+        +_prepare_prompts()
+        -_bb_feat_sizes
+    }
+
+    class SAM2VideoPredictor {
+        +init_state()
+        +add_new_prompts()
+        +propagate_in_video()
+        +get_im_features(batch)
+        +inference_state
+        +non_overlap_masks
+    }
+
+    class SAM2DynamicInteractivePredictor {
+        +inference()
+        +update_memory()
+        +track_step()
+        +get_maskmem_enc()
+        +memory_bank
+        +obj_idx_set
+        +obj_id_to_idx
+    }
+
+    BasePredictor <|-- Predictor
+    Predictor <|-- SAM2Predictor
+    SAM2Predictor <|-- SAM2VideoPredictor
+    SAM2VideoPredictor <|-- SAM2DynamicInteractivePredictor
+
+    note for SAM2DynamicInteractivePredictor "添加動態記憶體管理\n多物件追蹤\n持續學習"
+```
+
+### 核心組件架構
+
+```mermaid
+graph TB
+    subgraph "SAM2DynamicInteractivePredictor"
+        A[Predictor Instance] --> B[Memory Bank]
+        A --> C[Object Tracking]
+        A --> D[SAM2 Model]
+
+        B --> B1[Frame 1<br/>maskmem_features<br/>pred_masks<br/>obj_ptr]
+        B --> B2[Frame 2<br/>...]
+        B --> B3[Frame N<br/>...]
+
+        C --> C1[obj_idx_set]
+        C --> C2[obj_id_to_idx]
+        C --> C3[obj_idx_to_id]
+
+        D --> D1[Image Encoder]
+        D --> D2[Memory Attention]
+        D --> D3[Memory Encoder]
+        D --> D4[Prompt Encoder]
+        D --> D5[Mask Decoder]
+    end
+
+    subgraph "SAM2 Model Components"
+        D1 --> E1[Backbone<br/>Hiera/ViT]
+        D1 --> E2[Feature Pyramid<br/>Multi-scale]
+
+        D2 --> F1[Transformer<br/>Cross-Attention]
+
+        D4 --> G1[Point Encoder]
+        D4 --> G2[Box Encoder]
+        D4 --> G3[Mask Encoder]
+
+        D5 --> H1[SAM2MaskDecoder<br/>Transformer Decoder]
+        D5 --> H2[High-Res<br/>Upsampling]
+    end
+
+    style A fill:#e1f5ff
+    style B fill:#fff4e6
+    style C fill:#f0f0f0
+    style D fill:#e8f5e9
+```
+
+### SAM2DynamicInteractivePredictor 內部元件
+
+#### 1. Memory Bank 系統
+
+```mermaid
+graph LR
+    subgraph "Memory Bank Structure"
+        MB[Memory Bank List]
+
+        MB --> F1[Frame 0<br/>Consolidated Output]
+        MB --> F2[Frame 1<br/>Consolidated Output]
+        MB --> F3[Frame N<br/>Consolidated Output]
+
+        F1 --> F1A[maskmem_features<br/>形狀: max_obj_num, C, H, W]
+        F1 --> F1B[maskmem_pos_enc<br/>位置編碼列表]
+        F1 --> F1C[pred_masks<br/>形狀: max_obj_num, 1, H/4, W/4]
+        F1 --> F1D[obj_ptr<br/>形狀: max_obj_num, hidden_dim]
+        F1 --> F1E[object_score_logits<br/>形狀: max_obj_num, 1]
+    end
+
+    style MB fill:#ffecb3
+    style F1 fill:#fff9c4
+    style F2 fill:#fff9c4
+    style F3 fill:#fff9c4
+```
+
+#### 2. 物件追蹤系統
+
+```mermaid
+graph TB
+    subgraph "Object Tracking System"
+        OT[Object Tracking]
+
+        OT --> A[obj_idx_set<br/>已追蹤物件索引集合]
+        OT --> B[obj_id_to_idx<br/>用戶ID → 模型索引]
+        OT --> C[obj_idx_to_id<br/>模型索引 → 用戶ID]
+
+        A --> A1["例如: {0, 1, 2}"]
+        B --> B1["例如: {0:0, 1:1, 2:2}"]
+        C --> C1["例如: {0:0, 1:1, 2:2}"]
+    end
+
+    subgraph "Mapping Process"
+        UID[User obj_id] -->|_obj_id_to_idx| MID[Model obj_idx]
+        MID -->|用於模型內部| PROC[Processing]
+        PROC -->|結果按idx排列| RES[Results]
+        RES -->|過濾obj_idx_set| FINAL[Final Output]
+    end
+
+    style OT fill:#e1bee7
+    style UID fill:#ffcdd2
+    style MID fill:#c8e6c9
+```
+
+### 推理流程詳解
+
+#### 完整推理流程（update_memory=True）
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Predictor
+    participant ImageEncoder
+    participant MemorySystem
+    participant SAMComponents
+    participant MemoryBank
+
+    User->>Predictor: __call__(source, bboxes, obj_ids, update_memory=True)
+
+    Note over Predictor: 1. 圖像特徵提取
+    Predictor->>ImageEncoder: get_im_features(im)
+    ImageEncoder->>ImageEncoder: forward_image(im)
+    ImageEncoder->>ImageEncoder: _prepare_backbone_features()
+    ImageEncoder-->>Predictor: vision_feats, vision_pos_embeds
+
+    Note over Predictor: 2. 提示準備
+    Predictor->>Predictor: _prepare_prompts(bboxes, points, masks)
+    Note right of Predictor: 轉換 bboxes → points<br/>標籤 2, 3
+
+    Note over Predictor: 3. 更新記憶體（每個 obj_id）
+    Predictor->>MemorySystem: update_memory(obj_ids, points, labels)
+
+    loop 對每個 obj_id
+        MemorySystem->>MemorySystem: _obj_id_to_idx(obj_id)
+        MemorySystem->>MemorySystem: track_step(obj_idx, point, label)
+
+        MemorySystem->>SAMComponents: _prepare_memory_conditioned_features(obj_idx)
+
+        alt 無記憶體或初始幀
+            SAMComponents->>SAMComponents: vision_feats + no_mem_embed
+        else 有記憶體
+            SAMComponents->>MemoryBank: get_maskmem_enc()
+            MemoryBank-->>SAMComponents: 所有 frames 的記憶體
+            SAMComponents->>SAMComponents: memory_attention(curr, memory)
+        end
+
+        SAMComponents->>SAMComponents: _forward_sam_heads()
+        SAMComponents->>SAMComponents: sam_prompt_encoder(points, masks)
+        SAMComponents->>SAMComponents: sam_mask_decoder()
+        SAMComponents-->>MemorySystem: pred_masks, obj_ptr, scores
+
+        MemorySystem->>MemorySystem: 合併到 consolidated_out[obj_idx]
+    end
+
+    Note over MemorySystem: 4. 編碼記憶體
+    MemorySystem->>SAMComponents: _encode_new_memory(pred_masks)
+    SAMComponents-->>MemorySystem: maskmem_features, maskmem_pos_enc
+
+    MemorySystem->>MemoryBank: append(consolidated_out)
+    Note right of MemoryBank: Memory Bank 增加 1 個 frame
+
+    Note over Predictor: 5. 最終追蹤
+    Predictor->>Predictor: track_step()
+    Note right of Predictor: 使用所有記憶體<br/>預測所有物件
+
+    Predictor-->>User: Results(masks, scores)
+```
+
+#### 僅推理流程（update_memory=False）
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Predictor
+    participant ImageEncoder
+    participant MemorySystem
+    participant SAMComponents
+    participant MemoryBank
+
+    User->>Predictor: __call__(source, update_memory=False)
+
+    Note over Predictor: 1. 圖像特徵提取
+    Predictor->>ImageEncoder: get_im_features(im)
+    ImageEncoder-->>Predictor: vision_feats, vision_pos_embeds
+
+    Note over Predictor: 2. 追蹤步驟（所有物件）
+    Predictor->>MemorySystem: track_step(obj_idx=None)
+
+    MemorySystem->>SAMComponents: _prepare_memory_conditioned_features(None)
+
+    SAMComponents->>MemoryBank: get_maskmem_enc()
+    MemoryBank-->>SAMComponents: 合併所有 frames 的記憶體
+    Note right of MemoryBank: memory 形狀:<br/>(total_HW, B, C)
+
+    SAMComponents->>SAMComponents: memory_attention(curr, memory)
+    Note right of SAMComponents: 結合歷史記憶體<br/>條件化當前特徵
+
+    SAMComponents->>SAMComponents: _forward_sam_heads()
+    Note right of SAMComponents: 無提示輸入<br/>使用記憶體特徵
+
+    SAMComponents-->>MemorySystem: pred_masks (所有物件)
+
+    MemorySystem->>MemorySystem: 過濾 obj_idx_set
+    Note right of MemorySystem: 只返回已追蹤<br/>物件的 masks
+
+    MemorySystem-->>Predictor: pred_masks, scores
+    Predictor-->>User: Results
+
+    Note over MemoryBank: Memory Bank 大小不變
+```
+
+### 數據流圖
+
+#### 圖像特徵提取流程
+
+```mermaid
+flowchart TD
+    A[Input Image<br/>H x W x 3] --> B[Preprocess<br/>Resize to imgsz]
+    B --> C[Image Encoder<br/>Backbone]
+
+    C --> D[forward_image]
+    D --> E[backbone_fpn<br/>Multi-scale features]
+    D --> F[vision_pos_enc<br/>Positional encoding]
+
+    E --> G[_prepare_backbone_features]
+    G --> H1[Level 0: H/4 x W/4]
+    G --> H2[Level 1: H/8 x W/8]
+    G --> H3[Level 2: H/16 x W/16]
+
+    H1 --> I[vision_feats List]
+    H2 --> I
+    H3 --> I
+
+    I --> J{直接添加<br/>no_mem_embed?}
+    J -->|Yes| K[vision_feats + no_mem_embed]
+    J -->|No| L[vision_feats]
+
+    K --> M[High-Res Features<br/>用於精細化]
+    L --> M
+
+    M --> N[存儲到<br/>self.vision_feats<br/>self.vision_pos_embeds<br/>self.high_res_features]
+
+    style A fill:#ffebee
+    style C fill:#e3f2fd
+    style I fill:#f3e5f5
+    style N fill:#e8f5e9
+```
+
+#### Memory Bank 數據流
+
+```mermaid
+flowchart TB
+    subgraph "Input Processing"
+        A[提示輸入<br/>bboxes/points/masks] --> B[_prepare_prompts]
+        B --> C[統一為 points 格式]
+        C --> D[每個 obj_id 對應<br/>一組 points + labels]
+    end
+
+    subgraph "Per-Object Processing"
+        D --> E[Loop: obj_id in obj_ids]
+        E --> F[track_step obj_idx]
+
+        F --> G{有記憶體?}
+        G -->|Yes| H[get_maskmem_enc<br/>獲取所有 frames]
+        G -->|No| I[no_mem_embed]
+
+        H --> J[memory_attention<br/>結合歷史信息]
+        I --> J
+
+        J --> K[_forward_sam_heads<br/>生成 mask]
+        K --> L[pred_masks<br/>obj_ptr<br/>scores]
+
+        L --> M[合併到<br/>consolidated_out obj_idx]
+    end
+
+    subgraph "Memory Encoding"
+        M --> N{所有 obj_ids<br/>處理完?}
+        N -->|No| E
+        N -->|Yes| O[_encode_new_memory]
+
+        O --> P[編碼 pred_masks]
+        P --> Q[maskmem_features<br/>maskmem_pos_enc]
+
+        Q --> R[添加到 consolidated_out]
+    end
+
+    subgraph "Memory Bank Update"
+        R --> S[memory_bank.append<br/>consolidated_out]
+        S --> T[Memory Bank 增長]
+
+        T --> U{Memory Bank 結構}
+        U --> V[Frame 0]
+        U --> W[Frame 1]
+        U --> X[Frame N 新增]
+    end
+
+    style A fill:#fff3e0
+    style E fill:#e1f5fe
+    style K fill:#f3e5f5
+    style S fill:#c8e6c9
+    style X fill:#ffcdd2
+```
+
+### 組件交互圖
+
+#### SAM2DynamicInteractivePredictor 與 SAM2 Model 的交互
+
+```mermaid
+graph TB
+    subgraph "SAM2DynamicInteractivePredictor Layer"
+        A[User API<br/>inference method]
+        B[Memory Management<br/>update_memory]
+        C[Object Tracking<br/>obj_id mapping]
+        D[Frame Cache<br/>memory_bank]
+    end
+
+    subgraph "SAM2VideoPredictor Layer"
+        E[Video State<br/>inference_state]
+        F[Batch Processing<br/>get_im_features]
+    end
+
+    subgraph "SAM2Predictor Layer"
+        G[Prompt Preparation<br/>_prepare_prompts]
+        H[Feature Inference<br/>_inference_features]
+    end
+
+    subgraph "SAM2 Model Core"
+        I[Image Encoder<br/>forward_image]
+        J[Memory Attention<br/>memory_attention]
+        K[Memory Encoder<br/>_encode_new_memory]
+        L[Prompt Encoder<br/>sam_prompt_encoder]
+        M[Mask Decoder<br/>sam_mask_decoder]
+    end
+
+    A --> B
+    A --> C
+    B --> D
+    C --> E
+    E --> F
+    F --> G
+    G --> H
+
+    H --> I
+    H --> J
+    B --> K
+    G --> L
+    H --> M
+
+    D -.記憶體回饋.-> J
+    K -.編碼輸出.-> D
+
+    style A fill:#e3f2fd
+    style B fill:#fff9c4
+    style C fill:#f3e5f5
+    style D fill:#ffccbc
+    style I fill:#c8e6c9
+    style J fill:#c8e6c9
+    style K fill:#c8e6c9
+    style L fill:#c8e6c9
+    style M fill:#c8e6c9
+```
+
+### 關鍵設計決策
+
+#### 1. Memory Bank 設計
+
+**為什麼使用列表而不是字典？**
+
+```python
+# 當前設計
+self.memory_bank = [frame_0, frame_1, frame_2, ...]  # List
+
+# 替代方案（註釋中提到）
+# self.memory_bank = {0: frame_0, 1: frame_1, ...}  # Dict
+```
+
+**原因**：
+- ✅ **簡單性**：順序訪問，索引即為幀序號
+- ✅ **記憶體注意力**：`get_maskmem_enc()` 只需簡單遍歷列表
+- ✅ **性能**：列表遍歷比字典快
+- ⚠️ **局限性**：不支持按幀 ID 快速查找（但實際不需要）
+
+#### 2. 物件 ID 映射
+
+**為什麼需要 obj_id_to_idx 映射？**
+
+```mermaid
+flowchart LR
+    A[User obj_id<br/>任意整數 < max_obj_num] --> B[obj_id_to_idx]
+    B --> C[Model obj_idx<br/>0, 1, 2, ..., max_obj_num-1]
+
+    C --> D[固定大小 Tensor<br/>max_obj_num, ...]
+
+    D --> E[預分配內存<br/>避免動態調整]
+
+    style A fill:#ffcdd2
+    style C fill:#c8e6c9
+    style D fill:#bbdefb
+    style E fill:#fff9c4
+```
+
+**原因**：
+- ✅ **固定特徵大小**：模型使用固定大小的 tensors（max_obj_num）
+- ✅ **批處理效率**：所有物件在同一個 batch 中處理
+- ✅ **GPU 友好**：避免動態內存分配
+
+#### 3. 提示統一為 Points
+
+**為什麼 Bboxes 轉換為 Points？**
+
+```python
+# 源代碼：SAM2Predictor._prepare_prompts (行 762-773)
+if bboxes is not None:
+    bboxes = bboxes.view(-1, 2, 2)  # (N, 4) → (N, 2, 2)
+    bbox_labels = torch.tensor([[2, 3]], ...)  # 特殊標籤
+
+    if points is not None:
+        points = torch.cat([bboxes, points], dim=1)  # 連接
+        labels = torch.cat([bbox_labels, labels], dim=1)
+    else:
+        points, labels = bboxes, bbox_labels
+```
+
+**設計優勢**：
+- ✅ **統一接口**：SAM Prompt Encoder 只需處理一種格式
+- ✅ **靈活組合**：bbox + points 可以混用
+- ✅ **簡化實現**：減少條件分支
+
+#### 4. Non-Overlapping Masks
+
+**為什麼需要非重疊約束？**
+
+```mermaid
+graph TB
+    A[多個物件 Masks] --> B{non_overlap_masks?}
+
+    B -->|True| C[_apply_non_overlapping_constraints]
+    B -->|False| D[保持原始 Masks]
+
+    C --> E[優先級：obj_idx 較小優先]
+    E --> F[Mask 0 完整]
+    E --> G[Mask 1 減去 Mask 0]
+    E --> H[Mask 2 減去 Mask 0, 1]
+
+    F --> I[清晰的物件邊界]
+    G --> I
+    H --> I
+
+    D --> J[可能重疊]
+
+    style A fill:#ffecb3
+    style C fill:#c8e6c9
+    style I fill:#bbdefb
+    style J fill:#ffcdd2
+```
+
+**應用場景**：
+- ✅ **視頻追蹤**：避免物件 ID 混淆
+- ✅ **實例分割**：每個像素只屬於一個物件
+- ⚠️ **半透明物件**：可能需要關閉（設為 False）
+
+### 與原始 SAM2 的差異
+
+#### 功能比較表
+
+| 特性 | SAM2Predictor | SAM2VideoPredictor | SAM2DynamicInteractive |
+|------|---------------|-------------------|----------------------|
+| **單圖推理** | ✅ | ✅ | ✅ |
+| **視頻追蹤** | ❌ | ✅ | ✅ |
+| **動態添加物件** | ❌ | ⚠️ 受限 | ✅ 完全支持 |
+| **持續學習** | ❌ | ❌ | ✅ |
+| **Memory Bank** | ❌ | ✅ (inference_state) | ✅ (memory_bank) |
+| **跨圖像追蹤** | ❌ | ⚠️ 視頻序列 | ✅ 獨立圖像 |
+| **多次精煉** | ❌ | ⚠️ 受限 | ✅ |
+| **API 簡單性** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ |
+
+#### 架構差異
+
+```mermaid
+graph TB
+    subgraph "SAM2Predictor 架構"
+        A1[Single Image] --> A2[Extract Features]
+        A2 --> A3[Prompt Encode]
+        A3 --> A4[Mask Decode]
+        A4 --> A5[Output Masks]
+    end
+
+    subgraph "SAM2VideoPredictor 架構"
+        B1[Video Frames] --> B2[Init State]
+        B2 --> B3[Add Prompts]
+        B3 --> B4[Propagate]
+        B4 --> B5[Track]
+        B5 --> B6[Output Masks]
+
+        B7[inference_state] -.管理狀態.-> B3
+        B7 -.管理狀態.-> B4
+        B7 -.管理狀態.-> B5
+    end
+
+    subgraph "SAM2DynamicInteractive 架構"
+        C1[Image Sequence<br/>獨立或視頻] --> C2[Get Features]
+        C2 --> C3{update_memory?}
+
+        C3 -->|Yes| C4[Update Memory]
+        C4 --> C5[Track Step]
+        C5 --> C6[Encode Memory]
+        C6 --> C7[Append to Bank]
+
+        C3 -->|No| C8[Track with Memory]
+
+        C7 --> C9[Output Masks]
+        C8 --> C9
+
+        C10[memory_bank] -.累積記憶體.-> C8
+        C7 -.更新.-> C10
+    end
+
+    style A1 fill:#e3f2fd
+    style B1 fill:#fff9c4
+    style C1 fill:#c8e6c9
+    style C10 fill:#ffccbc
+```
+
+### 性能考量
+
+#### Memory Bank 大小影響
+
+```mermaid
+graph LR
+    A[Memory Bank 大小] --> B{影響因素}
+
+    B --> C1[推理速度<br/>線性下降]
+    B --> C2[內存使用<br/>線性增長]
+    B --> C3[準確性<br/>可能提升]
+
+    C1 --> D1[get_maskmem_enc<br/>遍歷所有 frames]
+    C2 --> D2[每個 frame 存儲<br/>多個 tensors]
+    C3 --> D3[更多歷史信息<br/>更好的上下文]
+
+    D1 --> E[建議：策略性更新<br/>不要每幀都 update]
+    D2 --> E
+    D3 --> E
+
+    style A fill:#ffccbc
+    style C1 fill:#ffcdd2
+    style C2 fill:#ffcdd2
+    style C3 fill:#c8e6c9
+    style E fill:#fff9c4
+```
+
+#### 最佳實踐建議
+
+```mermaid
+mindmap
+  root((性能優化))
+    Memory Bank
+      每 N 幀更新一次
+      物件變化時更新
+      避免冗餘 frames
+      定期清理舊記憶體
+
+    Batch Processing
+      同一圖像多物件一次處理
+      減少特徵提取次數
+      統一提示格式
+
+    設備優化
+      使用 GPU
+      適當的 batch size
+      mixed precision
+
+    物件數量
+      只追蹤必要物件
+      max_obj_num 適當設置
+      及時移除不需要的物件
+```
+
+### 擴展點
+
+SAM2DynamicInteractivePredictor 設計了多個擴展點，允許自定義行為：
+
+#### 1. 自定義 Memory 策略
+
+```python
+class CustomMemoryPredictor(SAM2DynamicInteractivePredictor):
+    def update_memory(self, obj_ids, points, labels, masks):
+        # 在添加前可以過濾或修改
+        # 例如：只保留最近 K 個 frames
+        if len(self.memory_bank) >= self.max_memory_frames:
+            self.memory_bank.pop(0)  # 移除最舊的
+
+        super().update_memory(obj_ids, points, labels, masks)
+```
+
+#### 2. 自定義物件優先級
+
+```python
+class PriorityPredictor(SAM2DynamicInteractivePredictor):
+    def __init__(self, *args, object_priorities=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.object_priorities = object_priorities or {}
+
+    def _apply_priority_masks(self, masks):
+        # 根據優先級而非 obj_idx 應用非重疊約束
+        sorted_indices = sorted(
+            range(len(masks)),
+            key=lambda i: self.object_priorities.get(i, 0),
+            reverse=True
+        )
+        # 自定義非重疊邏輯
+        pass
+```
+
+#### 3. 集成外部追蹤器
+
+```python
+class HybridPredictor(SAM2DynamicInteractivePredictor):
+    def __init__(self, *args, external_tracker=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.external_tracker = external_tracker
+
+    def track_step(self, obj_idx=None, point=None, label=None, mask=None):
+        # 先使用外部追蹤器獲取粗略位置
+        if self.external_tracker and obj_idx is not None:
+            rough_bbox = self.external_tracker.track(obj_idx)
+            # 轉換為 point 提示
+            point = self._bbox_to_center_point(rough_bbox)
+
+        return super().track_step(obj_idx, point, label, mask)
+```
+
+---
+
 ## API 參考
 
 ### 類：SAM2DynamicInteractivePredictor
