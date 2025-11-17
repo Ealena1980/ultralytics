@@ -2495,6 +2495,482 @@ predictor(
 # 形狀不匹配錯誤
 ```
 
+### 8. Memory Bank 直接操作（高級用法）
+
+#### update_memory=False 的行為
+
+**重要發現**：`update_memory=False` 時，Memory Bank **完全不會改變**。
+
+```python
+# 假設已有 5 個 frames
+print(f"初始 Memory Bank 大小: {len(predictor.memory_bank)}")  # 5
+
+# update_memory=False 推理（默認）
+for i in range(100):
+    results = predictor(source=f"frame_{i}.jpg", update_memory=False)
+
+print(f"推理後 Memory Bank 大小: {len(predictor.memory_bank)}")  # 仍然是 5
+
+# ✅ 結論：update_memory=False 是只讀操作，不會增加記憶體
+```
+
+**源代碼確認**（`predict.py:1774-1789`）：
+
+```python
+def inference(self, im, bboxes=None, ..., update_memory=False):
+    self.get_im_features(im)
+    points, labels, masks = self._prepare_prompts(...)
+
+    if update_memory:  # ← 只有 True 時才執行
+        self.update_memory(obj_ids, points, labels, masks)
+
+    # 無論如何都執行（使用現有記憶體）
+    current_out = self.track_step()
+    return pred_masks, pred_scores
+```
+
+**性能提示**：
+- ✅ **推理模式**：大量推理時使用 `update_memory=False`（默認）
+- ✅ **標註模式**：標註新物件或精煉時使用 `update_memory=True`
+
+---
+
+#### 手動刪除和修改 Memory Bank 中的 Frame
+
+**關鍵發現**：`memory_bank` 就是一個普通的 Python **list**，可以直接操作！
+
+**❌ 內建刪除功能**：SAM2DynamicInteractivePredictor 沒有提供內建的刪除方法。
+
+**✅ 手動操作**：完全可以直接操作 `predictor.memory_bank`。
+
+##### 場景 1: 刪除最後一個 Frame（最常見）
+
+```python
+# 場景：第 7 張標註結果不滿意，想重新標註
+
+# 查看當前狀態
+print(f"Memory Bank 大小: {len(predictor.memory_bank)}")  # 7
+
+# ✅ 方法 1: 刪除最後一個 frame（推薦）
+last_frame = predictor.memory_bank.pop()  # 移除並返回最後一個
+print(f"已刪除 frame，剩餘: {len(predictor.memory_bank)}")  # 6
+
+# 重新標註第 7 張（使用新的提示）
+predictor(
+    source="frame_0007.jpg",
+    points=[[新的點位置]],
+    labels=[1],
+    obj_ids=[0],
+    update_memory=True  # 添加新的 frame
+)
+print(f"重新標註後: {len(predictor.memory_bank)}")  # 7
+```
+
+**完整工作流程**：
+
+```python
+from ultralytics.models.sam import SAM2DynamicInteractivePredictor
+
+# 初始化
+overrides = dict(conf=0.01, task="segment", mode="predict", imgsz=1024, model="sam2_b.pt", save=False)
+predictor = SAM2DynamicInteractivePredictor(overrides=overrides, max_obj_num=10)
+
+# 標註前 6 張
+for i in range(6):
+    predictor(
+        source=f"frame_{i:04d}.jpg",
+        bboxes=[[100, 100, 200, 200]],
+        obj_ids=[0],
+        update_memory=True
+    )
+
+# 第 7 張：嘗試 1
+predictor(
+    source="frame_0006.jpg",
+    points=[[150, 150]],  # 第一次嘗試
+    labels=[1],
+    obj_ids=[0],
+    update_memory=True
+)
+
+# 檢查結果
+results = predictor(source="frame_0007.jpg")
+# 假設結果不滿意...
+
+# 刪除第 7 張的標註
+predictor.memory_bank.pop()
+print(f"已刪除，回到 {len(predictor.memory_bank)} 個 frames")
+
+# 第 7 張：嘗試 2（使用不同的提示）
+predictor(
+    source="frame_0006.jpg",
+    points=[[150, 150], [180, 180]],  # 第二次嘗試：2 個點
+    labels=[1, 0],  # 正向 + 負向
+    obj_ids=[0],
+    update_memory=True
+)
+
+# 再次檢查結果
+results = predictor(source="frame_0007.jpg")
+# 如果滿意，繼續；如果不滿意，再次 pop() 重試
+```
+
+##### 場景 2: 刪除中間的 Frame
+
+```python
+# 假設有 10 個 frames，想刪除第 5 個（索引 4）
+
+print(f"初始大小: {len(predictor.memory_bank)}")  # 10
+
+# ✅ 方法：使用 list 的 del 或 pop
+deleted_frame = predictor.memory_bank.pop(4)  # 刪除索引 4 的 frame
+# 或
+# del predictor.memory_bank[4]
+
+print(f"刪除後大小: {len(predictor.memory_bank)}")  # 9
+
+# ⚠️ 注意：刪除中間 frame 後，後續的 frames 索引會改變
+# Frame 0, 1, 2, 3, [刪除], 5, 6, 7, 8, 9
+# 變成:
+# Frame 0, 1, 2, 3, 4, 5, 6, 7, 8
+```
+
+**警告**：刪除中間 frame 可能影響時間連續性！
+
+##### 場景 3: 批量刪除多個 Frames
+
+```python
+# 刪除最後 N 個 frames
+N = 3
+for _ in range(N):
+    if len(predictor.memory_bank) > 0:
+        predictor.memory_bank.pop()
+
+# 或使用切片（更高效）
+N = 3
+predictor.memory_bank = predictor.memory_bank[:-N]  # 保留除最後 N 個外的所有
+
+# 刪除特定範圍的 frames（例如索引 5-7）
+del predictor.memory_bank[5:8]  # 刪除索引 5, 6, 7
+```
+
+##### 場景 4: 替換特定 Frame
+
+```python
+# 假設想替換第 7 個 frame（索引 6）
+
+# ❌ 錯誤方法：直接賦值（不推薦，破壞內部結構）
+# predictor.memory_bank[6] = some_new_frame  # 危險！
+
+# ✅ 正確方法：刪除後重新添加
+# 1. 刪除舊的
+del predictor.memory_bank[6]
+
+# 2. 重新標註該 frame
+predictor(
+    source="frame_0006.jpg",
+    points=[[新座標]],
+    labels=[1],
+    obj_ids=[0],
+    update_memory=True
+)
+# 注意：這會添加到末尾，不是索引 6！
+
+# 更好的方法：如果是最後一個 frame
+if frame_index == len(predictor.memory_bank) - 1:
+    predictor.memory_bank.pop()  # 刪除最後一個
+    predictor(source=..., update_memory=True)  # 重新添加
+```
+
+##### 場景 5: 檢查和驗證 Frame 內容
+
+```python
+# 檢查特定 frame 的內容
+frame_idx = 6
+frame = predictor.memory_bank[frame_idx]
+
+print(f"Frame {frame_idx} 內容:")
+print(f"  - Keys: {frame.keys()}")
+print(f"  - Mask features shape: {frame['maskmem_features'].shape}")
+print(f"  - Predicted masks shape: {frame['pred_masks'].shape}")
+print(f"  - Object scores: {frame['object_score_logits'].flatten()}")
+
+# 檢查是否有特定物件的數據
+obj_idx = 0
+mask = frame['pred_masks'][obj_idx]
+score = frame['object_score_logits'][obj_idx]
+print(f"物件 {obj_idx} - Mask shape: {mask.shape}, Score: {score.item()}")
+
+# 檢查 mask 是否有效（不是佔位符）
+if mask.max() > -1000:  # 有效 mask
+    print("這是有效的 mask")
+else:
+    print("這是佔位符（未使用）")
+```
+
+#### Memory Bank 操作的最佳實踐
+
+##### ✅ 推薦的操作
+
+```python
+# 1. 刪除最後 N 個 frames（安全）
+for _ in range(N):
+    predictor.memory_bank.pop()
+
+# 2. 清空所有 frames（重新開始）
+predictor.memory_bank.clear()
+# 注意：還需要重置物件追蹤
+predictor.obj_idx_set.clear()
+
+# 3. 保存副本後操作（可以回滾）
+import copy
+backup = copy.deepcopy(predictor.memory_bank)
+try:
+    # 嘗試操作
+    predictor.memory_bank.pop()
+    results = predictor(source="test.jpg")
+    if not satisfactory:
+        # 回滾
+        predictor.memory_bank = backup
+except Exception as e:
+    # 出錯時恢復
+    predictor.memory_bank = backup
+    raise
+
+# 4. 使用快照系統（更安全）
+from MemoryBankSnapshot import MemoryBankSnapshot
+snapshot_manager = MemoryBankSnapshot(predictor)
+snapshot_manager.save_snapshot("before_frame_7")
+
+# 嘗試標註
+predictor(source="frame_7.jpg", points=[[...]], obj_ids=[0], update_memory=True)
+
+# 如果不滿意，恢復
+snapshot_manager.restore_snapshot("before_frame_7")
+```
+
+##### ❌ 避免的操作
+
+```python
+# ❌ 1. 直接修改 frame 內部的 tensors（破壞一致性）
+predictor.memory_bank[5]['pred_masks'][0] = some_tensor  # 危險！
+
+# ❌ 2. 刪除 frame 但不考慮物件狀態
+predictor.memory_bank.pop()  # OK
+# 但如果這個 frame 包含新物件的首次出現，
+# 需要同時從 obj_idx_set 中移除該物件！
+
+# ❌ 3. 插入手動構造的 frame（結構可能不正確）
+fake_frame = {'maskmem_features': ..., 'pred_masks': ...}
+predictor.memory_bank.append(fake_frame)  # 非常危險！
+
+# ❌ 4. 在多線程環境中不加鎖地操作
+# predictor.memory_bank 不是線程安全的！
+```
+
+#### 實用工具函數
+
+##### 安全刪除最後 N 個 Frames
+
+```python
+def safe_remove_last_frames(predictor, n):
+    """
+    安全地刪除最後 N 個 frames
+
+    Args:
+        predictor: SAM2DynamicInteractivePredictor 實例
+        n: 要刪除的 frames 數量
+
+    Returns:
+        removed_frames: 被刪除的 frames 列表（用於恢復）
+    """
+    if n <= 0:
+        return []
+
+    if n > len(predictor.memory_bank):
+        raise ValueError(f"無法刪除 {n} 個 frames，只有 {len(predictor.memory_bank)} 個")
+
+    removed_frames = []
+    for _ in range(n):
+        removed_frames.append(predictor.memory_bank.pop())
+
+    print(f"✅ 已刪除 {n} 個 frames，剩餘 {len(predictor.memory_bank)} 個")
+    return removed_frames
+
+# 使用
+removed = safe_remove_last_frames(predictor, 3)
+
+# 如果需要恢復
+for frame in reversed(removed):
+    predictor.memory_bank.append(frame)
+```
+
+##### 條件式刪除（基於質量分數）
+
+```python
+def remove_low_quality_frames(predictor, score_threshold=0.5):
+    """
+    刪除質量分數低於閾值的 frames
+
+    Args:
+        predictor: SAM2DynamicInteractivePredictor 實例
+        score_threshold: 最低質量分數閾值
+
+    Returns:
+        removed_count: 刪除的 frames 數量
+    """
+    original_count = len(predictor.memory_bank)
+    new_memory_bank = []
+
+    for i, frame in enumerate(predictor.memory_bank):
+        scores = frame['object_score_logits'].flatten()
+        max_score = scores.max().item()
+
+        # 轉換分數範圍 [-32, 32] → [0, 1]
+        normalized_score = max(0, min(1, (max_score + 32) / 64))
+
+        if normalized_score >= score_threshold:
+            new_memory_bank.append(frame)
+        else:
+            print(f"刪除 frame {i}，分數: {normalized_score:.3f}")
+
+    predictor.memory_bank = new_memory_bank
+    removed_count = original_count - len(new_memory_bank)
+
+    print(f"✅ 刪除了 {removed_count} 個低質量 frames")
+    return removed_count
+
+# 使用
+removed_count = remove_low_quality_frames(predictor, score_threshold=0.3)
+```
+
+##### 重標註最後一個 Frame 的輔助函數
+
+```python
+def reannotate_last_frame(predictor, source, **new_prompts):
+    """
+    刪除最後一個 frame 並使用新提示重新標註
+
+    Args:
+        predictor: SAM2DynamicInteractivePredictor 實例
+        source: 圖像源
+        **new_prompts: 新的提示參數（bboxes, points, labels, masks, obj_ids）
+
+    Example:
+        reannotate_last_frame(
+            predictor,
+            source="frame_7.jpg",
+            points=[[150, 150], [200, 200]],
+            labels=[1, 0],
+            obj_ids=[0],
+            update_memory=True
+        )
+    """
+    if len(predictor.memory_bank) == 0:
+        raise ValueError("Memory bank 為空，無法刪除")
+
+    # 保存原始大小
+    original_size = len(predictor.memory_bank)
+
+    # 刪除最後一個
+    removed_frame = predictor.memory_bank.pop()
+    print(f"已刪除最後一個 frame，剩餘 {len(predictor.memory_bank)} 個")
+
+    try:
+        # 使用新提示重新標註
+        new_prompts['update_memory'] = True  # 確保更新記憶體
+        results = predictor(source=source, **new_prompts)
+
+        print(f"✅ 重新標註成功，Memory Bank 大小: {len(predictor.memory_bank)}")
+        return results
+
+    except Exception as e:
+        # 出錯時恢復
+        print(f"❌ 重新標註失敗: {e}")
+        print("正在恢復原始 frame...")
+        predictor.memory_bank.append(removed_frame)
+        raise
+
+# 使用範例
+results = reannotate_last_frame(
+    predictor,
+    source="frame_0007.jpg",
+    points=[[150, 150], [180, 180], [200, 200]],  # 3 個點而不是 1 個
+    labels=[1, 1, 0],  # 2 正向 + 1 負向
+    obj_ids=[0]
+)
+```
+
+#### 調試和檢查工具
+
+```python
+def inspect_memory_bank(predictor, detailed=False):
+    """
+    檢查 Memory Bank 的詳細信息
+
+    Args:
+        predictor: SAM2DynamicInteractivePredictor 實例
+        detailed: 是否顯示詳細信息
+    """
+    print(f"\n📊 Memory Bank 檢查報告")
+    print(f"=" * 50)
+    print(f"總 Frames: {len(predictor.memory_bank)}")
+    print(f"已追蹤物件: {predictor.obj_idx_set}")
+    print(f"max_obj_num: {predictor._max_obj_num}")
+
+    if len(predictor.memory_bank) == 0:
+        print("⚠️ Memory Bank 為空")
+        return
+
+    # 計算總內存使用（估算）
+    total_memory = 0
+    for frame in predictor.memory_bank:
+        for key, value in frame.items():
+            if hasattr(value, 'element_size') and hasattr(value, 'nelement'):
+                total_memory += value.element_size() * value.nelement()
+
+    print(f"估算內存使用: {total_memory / 1024 / 1024:.2f} MB")
+
+    if detailed:
+        print(f"\n詳細 Frame 信息:")
+        for i, frame in enumerate(predictor.memory_bank):
+            print(f"\n  Frame {i}:")
+            for key, value in frame.items():
+                if hasattr(value, 'shape'):
+                    print(f"    - {key}: {value.shape}")
+                elif isinstance(value, list):
+                    print(f"    - {key}: List of {len(value)} items")
+                else:
+                    print(f"    - {key}: {type(value)}")
+
+            # 檢查物件分數
+            scores = frame['object_score_logits'].flatten()
+            active_objects = (scores > -30).sum().item()
+            print(f"    - 活躍物件: {active_objects}/{len(scores)}")
+
+# 使用
+inspect_memory_bank(predictor, detailed=True)
+```
+
+#### 總結：Memory Bank 操作指南
+
+| 操作 | 方法 | 安全性 | 用途 |
+|------|------|--------|------|
+| **刪除最後一個** | `pop()` | ✅ 非常安全 | 重新標註當前 frame |
+| **刪除多個** | `pop()` 循環 或 切片 | ✅ 安全 | 批量回退 |
+| **清空全部** | `clear()` | ⚠️ 需重置狀態 | 完全重新開始 |
+| **刪除中間** | `pop(index)` 或 `del` | ⚠️ 影響連續性 | 移除特定錯誤 |
+| **檢查內容** | 直接訪問 `[index]` | ✅ 完全安全 | 調試和分析 |
+| **修改內容** | 直接賦值 | ❌ 不推薦 | - |
+| **替換 frame** | 刪除+重新添加 | ✅ 安全 | 糾正錯誤標註 |
+
+**黃金法則**：
+1. ✅ **只讀訪問總是安全的**
+2. ✅ **pop() 最後幾個 frames 是安全的**
+3. ⚠️ **刪除中間 frames 要小心**
+4. ❌ **永遠不要直接修改 frame 內部的 tensors**
+5. ✅ **使用快照系統進行復雜操作**
+
 ---
 
 ## 架構設計與 SAM2 整合
