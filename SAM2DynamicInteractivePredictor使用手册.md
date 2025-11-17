@@ -2973,6 +2973,291 @@ inspect_memory_bank(predictor, detailed=True)
 
 ---
 
+## Bounding Box Prompt vs ROI 的區別
+
+### 核心概念澄清
+
+很多用戶會混淆 **BBox Prompt（邊界框提示）** 和 **ROI（Region of Interest，感興趣區域）**，認為它們是相同的概念。實際上，它們在 SAM2DynamicInteractivePredictor 中有著本質的不同：
+
+#### BBox Prompt（邊界框提示）
+- **用途**：作為**提示信息**，引導模型關注特定區域
+- **處理範圍**：模型仍然處理**整張影像**
+- **輸出範圍**：生成的 mask **可以超出** bbox 範圍
+- **內部實現**：bbox 會被轉換為 **2 個特殊點**（labels 為 2 和 3）
+
+#### ROI（感興趣區域）
+- **用途**：**裁剪影像**，限制處理區域
+- **處理範圍**：模型只處理**裁剪後的區域**
+- **輸出範圍**：生成的 mask **不能超出** ROI 範圍
+- **內部實現**：影像在預處理階段被**物理裁剪**
+
+### SAM2DynamicInteractivePredictor 使用的是哪一種？
+
+**答案：BBox Prompt（邊界框提示）**
+
+SAM2DynamicInteractivePredictor 使用的 `bboxes` 參數是**提示信息**，而非 ROI 裁剪。這是一個重要的設計決策，因為：
+
+1. **保留全局上下文**：模型可以看到整張影像，理解物體與周圍環境的關係
+2. **更靈活的分割**：mask 可以精確覆蓋物體，即使物體邊界超出了 bbox
+3. **更高的準確性**：不會因為裁剪而丟失邊緣信息
+
+### 詳細對比
+
+| 特性 | BBox Prompt（SAM2 使用） | ROI（傳統方法） |
+|------|-------------------------|----------------|
+| **影像處理範圍** | 整張影像 | 僅裁剪區域 |
+| **Mask 輸出範圍** | 可以超出 bbox | 限制在 ROI 內 |
+| **全局上下文** | ✅ 保留 | ❌ 丟失 |
+| **邊緣精度** | ✅ 高（可精確到像素） | ⚠️ 受 ROI 邊界限制 |
+| **內部實現** | 轉換為 2 個特殊點 | 影像裁剪 |
+| **計算成本** | 處理整張影像 | 僅處理裁剪區域 |
+| **使用場景** | 物體分割、引導注意力 | 減少計算量、預定義區域 |
+
+### BBox → Points 轉換機制
+
+在 SAM2DynamicInteractivePredictor 中，當你傳入 `bboxes` 參數時，內部會進行以下轉換：
+
+```python
+# 原始 bbox: [x1, y1, x2, y2]
+bbox = [100, 100, 200, 200]
+
+# 內部轉換為 2 個點
+points = [
+    [100, 100],  # 左上角點 (x1, y1) - label=2
+    [200, 200]   # 右下角點 (x2, y2) - label=3
+]
+labels = [2, 3]  # 特殊標籤，表示這是 bbox 的兩個角點
+```
+
+**關鍵發現**（來自源碼 `ultralytics/models/sam/predict.py:762-773`）：
+
+```python
+def _prepare_prompts(self, dst_shape, src_shape, bboxes=None, points=None, labels=None, masks=None):
+    bboxes, points, labels, masks = super()._prepare_prompts(...)
+    if bboxes is not None:
+        # 將 bbox 重塑為 2 個點
+        bboxes = bboxes.view(-1, 2, 2)  # [x1,y1,x2,y2] → [[x1,y1], [x2,y2]]
+        bbox_labels = torch.tensor([[2, 3]], dtype=torch.int32, device=bboxes.device)
+
+        # 合併到 points 中
+        if points is not None:
+            points = torch.cat([bboxes, points], dim=1)  # bbox points 在前
+            labels = torch.cat([bbox_labels, labels], dim=1)
+        else:
+            points, labels = bboxes, bbox_labels
+    return points, labels, masks
+```
+
+### 視覺化對比
+
+#### BBox Prompt 工作流程（SAM2 實際使用）
+
+```mermaid
+graph TD
+    A[輸入: 完整影像 + BBox] --> B[特徵提取: 整張影像]
+    B --> C[BBox 轉換為 2 個特殊點<br/>labels: 2, 3]
+    C --> D[SAM2 模型處理<br/>使用全局上下文]
+    D --> E[生成 Mask<br/>可以超出 bbox 範圍]
+    E --> F[輸出: 精確物體 mask]
+
+    style C fill:#ffeb3b
+    style D fill:#4caf50
+    style E fill:#2196f3
+```
+
+#### ROI 工作流程（傳統方法，SAM2 不使用）
+
+```mermaid
+graph TD
+    A[輸入: 完整影像 + ROI] --> B[影像裁剪: 僅保留 ROI 區域]
+    B --> C[特徵提取: 裁剪後的小影像]
+    C --> D[模型處理<br/>無全局上下文]
+    D --> E[生成 Mask<br/>限制在 ROI 內]
+    E --> F[輸出: ROI 內的 mask]
+
+    style B fill:#ff9800
+    style D fill:#f44336
+    style E fill:#9c27b0
+```
+
+### 實際使用示例
+
+#### ✅ 正確：使用 BBox 作為 Prompt
+
+```python
+from ultralytics import SAM2DynamicInteractivePredictor
+
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+
+# BBox 作為提示，引導模型關注車輛
+results = predictor(
+    source="street.jpg",  # 完整的街道影像
+    bboxes=[[300, 200, 500, 400]],  # 大致框出車輛位置
+    obj_ids=[0],
+    update_memory=True
+)
+
+# 結果：
+# - 模型處理了整張影像（包括道路、建築物等上下文）
+# - 生成的 mask 精確覆蓋車輛
+# - mask 可能略微超出 bbox（例如車輛天線、後視鏡）
+# - 利用了周圍環境信息（道路、其他車輛）提高分割精度
+```
+
+#### ❌ 錯誤：誤解為 ROI 裁剪
+
+```python
+# ⚠️ 這是錯誤的理解方式
+# 用戶可能認為：
+# 1. 影像會被裁剪到 [300:400, 200:500]
+# 2. 模型只處理這個小區域
+# 3. mask 不會超出這個範圍
+
+# ✅ 實際情況：
+# 1. 影像不會被裁剪，整張影像都會被處理
+# 2. bbox 只是告訴模型「重點關注這裡」
+# 3. mask 可以精確覆蓋物體，即使超出 bbox
+```
+
+### BBox Prompt 與 Points Prompt 的混用
+
+由於 bbox 內部會轉換為點，因此可以與普通點無縫混用：
+
+```python
+# 混合使用 bbox 和 points
+results = predictor(
+    source="image.jpg",
+    bboxes=[[100, 100, 200, 200]],  # 轉換為 points: [[100,100], [200,200]], labels: [2,3]
+    points=[[150, 150], [180, 180]],  # 普通點, labels: [1, 0]
+    labels=[1, 0],  # 僅用於 points，bbox 的 labels 自動為 [2, 3]
+    obj_ids=[0],
+    update_memory=True
+)
+
+# 內部實際處理的 points 和 labels：
+# points: [[100,100], [200,200], [150,150], [180,180]]
+# labels: [2, 3, 1, 0]
+#         └─bbox─┘  └─user points─┘
+```
+
+### 常見誤解與澄清
+
+| 誤解 | 真相 |
+|------|------|
+| 「bbox 會裁剪影像」 | ❌ 影像不會被裁剪，整張影像都會被處理 |
+| 「mask 不能超出 bbox」 | ❌ mask 可以超出 bbox，精確覆蓋物體 |
+| 「bbox 提高了速度」 | ❌ 不會提高速度（仍處理整張影像），但提高了準確性 |
+| 「bbox 就是 ROI」 | ❌ bbox 是提示信息，ROI 是裁剪操作 |
+| 「bbox 和 points 不能混用」 | ❌ 可以混用，bbox 會轉換為特殊點 |
+
+### 什麼時候使用 BBox Prompt？
+
+**推薦使用場景**：
+
+1. **物體位置已知，但邊界不精確**
+   ```python
+   # 例如：從目標檢測器獲得的粗略框
+   detection_boxes = [[300, 200, 500, 400]]  # YOLO 檢測結果
+   predictor(source="image.jpg", bboxes=detection_boxes, obj_ids=[0], update_memory=True)
+   ```
+
+2. **快速標註多個物體**
+   ```python
+   # 用 bbox 快速框選，SAM2 自動精確分割
+   predictor(
+       source="image.jpg",
+       bboxes=[
+           [100, 100, 200, 200],  # 物體 1
+           [300, 150, 450, 300],  # 物體 2
+           [500, 200, 650, 400],  # 物體 3
+       ],
+       obj_ids=[0, 1, 2],
+       update_memory=True
+   )
+   ```
+
+3. **引導模型關注特定區域**
+   ```python
+   # 影像中有多個相似物體，用 bbox 指定要分割哪一個
+   predictor(source="crowd.jpg", bboxes=[[250, 300, 350, 500]], obj_ids=[0], update_memory=True)
+   ```
+
+**不推薦使用場景**：
+
+1. **精確點已知** → 直接使用 points 更高效
+2. **需要排除背景** → 使用負點（label=0）配合正點
+3. **已有精確 mask** → 直接使用 masks 參數
+
+### 什麼時候使用 ROI（如果需要）？
+
+SAM2DynamicInteractivePredictor **不支持 ROI**，但如果你確實需要 ROI 功能（例如減少計算量），可以在調用前手動裁剪：
+
+```python
+import cv2
+
+# 手動實現 ROI 裁剪（SAM2 不推薦，僅用於特殊需求）
+image = cv2.imread("large_image.jpg")
+roi_region = image[200:500, 300:600]  # 裁剪
+
+# 在裁剪後的影像上運行 SAM2
+results = predictor(
+    source=roi_region,  # 傳入裁剪後的影像
+    points=[[150, 150]],  # 相對於裁剪後影像的坐標
+    labels=[1],
+    obj_ids=[0],
+    update_memory=True
+)
+
+# ⚠️ 缺點：
+# 1. 丟失了全局上下文信息
+# 2. 需要手動管理坐標轉換
+# 3. 分割精度可能下降
+# 4. 無法處理跨 ROI 邊界的物體
+```
+
+### 最佳實踐
+
+1. **✅ 優先使用 BBox Prompt**
+   - 讓 SAM2 利用全局上下文
+   - 獲得更準確的分割結果
+   - 無需手動裁剪和坐標轉換
+
+2. **✅ 組合使用多種 Prompt**
+   ```python
+   # BBox 大致定位 + Points 精確引導
+   predictor(
+       source="image.jpg",
+       bboxes=[[100, 100, 300, 300]],  # 大致區域
+       points=[[200, 200]],             # 精確的物體中心點
+       labels=[1],
+       obj_ids=[0],
+       update_memory=True
+   )
+   ```
+
+3. **✅ 理解 BBox 的作用**
+   - 把 bbox 當作「這裡有個物體」的提示
+   - 而不是「只處理這個區域」的指令
+
+4. **⚠️ 避免過度依賴 BBox**
+   - 如果已經有精確點，直接用點更高效
+   - BBox 主要用於快速標註和引導注意力
+
+### 總結
+
+| 概念 | SAM2DynamicInteractivePredictor 中的實現 |
+|------|----------------------------------------|
+| **BBox 用途** | ✅ 作為提示信息（Prompt），引導模型關注 |
+| **影像處理** | ✅ 處理整張影像，保留全局上下文 |
+| **Mask 範圍** | ✅ 可以超出 bbox，精確覆蓋物體 |
+| **內部轉換** | ✅ bbox → 2 個特殊點（labels: 2, 3） |
+| **ROI 裁剪** | ❌ 不使用 ROI 裁剪 |
+| **計算優化** | ❌ 不會因 bbox 減少計算量 |
+
+**關鍵要點**：在 SAM2DynamicInteractivePredictor 中，`bboxes` 參數是**語義級別的引導提示**，而非**幾何級別的區域限制**。這是 SAM2 強大分割能力的關鍵設計之一。
+
+---
+
 ## 架構設計與 SAM2 整合
 
 ### 系統架構概覽
