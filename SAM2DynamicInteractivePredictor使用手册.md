@@ -3556,6 +3556,13 @@ final_result = predictor_final(source="image.jpg", points=[best_point], labels=[
 
 ## ROI 預處理與多料件分割工作流
 
+> **💡 重要提示：本章節為外部實踐指南**
+>
+> - ✅ 本章節展示的是**用戶側的外部實踐方法**
+> - ✅ **不需要修改** Ultralytics 庫的任何源代碼
+> - ✅ 所有代碼都是用戶可以在自己項目中使用的輔助工具
+> - ✅ 僅使用 Ultralytics 提供的公開 API（`SAM2DynamicInteractivePredictor`、`YOLO` 等）
+
 ### 應用場景
 
 在工業檢測、醫療影像等領域，常見以下場景：
@@ -3596,9 +3603,24 @@ graph TD
     style H fill:#2196f3
 ```
 
-### 完整實現：多料件 ROI 分割系統
+### 外部實踐：多料件 ROI 分割輔助工具
+
+**重要說明**：
+- ✅ 以下代碼是**用戶側的輔助工具類**，保存為獨立的 Python 文件（例如 `roi_segmentation_helper.py`）
+- ✅ **不需要修改** Ultralytics 庫的任何源代碼
+- ✅ 這是**外部使用者的實踐範例**，展示如何組合使用 SAM2DynamicInteractivePredictor
+- ✅ 用戶可以直接複製此代碼到自己的項目中使用
+
+#### 用戶側輔助類：MultiPartROISegmentation
+
+將以下代碼保存為 `roi_segmentation_helper.py`：
 
 ```python
+"""
+多料件 ROI 分割輔助工具
+這是用戶側的工具類，不修改 Ultralytics 庫代碼
+"""
+
 import cv2
 import numpy as np
 from ultralytics import SAM2DynamicInteractivePredictor
@@ -3606,10 +3628,12 @@ from typing import List, Tuple, Dict
 import torch
 
 class MultiPartROISegmentation:
-    """多料件 ROI 分割系統
+    """多料件 ROI 分割系統（用戶側輔助工具）
 
     用於處理大幅面影像中的多個料件，通過 ROI 裁剪減少記憶體消耗，
-    利用 SAM2 的自動分割能力實現最小化標註。
+    利用 SAM2DynamicInteractivePredictor 的能力實現最小化標註。
+
+    這是外部工具類，不需要修改 Ultralytics 庫源代碼。
     """
 
     def __init__(
@@ -3919,11 +3943,38 @@ class MultiPartROISegmentation:
         print(f"Visualization saved to: {output_path}")
 ```
 
-### 使用示例
+### 如何使用這個輔助工具
+
+**步驟 1：保存輔助類代碼**
+
+將上述 `MultiPartROISegmentation` 類的完整代碼保存為 `roi_segmentation_helper.py`
+
+**步驟 2：在你的項目中導入使用**
+
+在你的項目文件（例如 `my_project.py`）中：
+
+```python
+# 導入輔助工具（與 roi_segmentation_helper.py 在同一目錄）
+from roi_segmentation_helper import MultiPartROISegmentation
+
+# 或者如果放在不同目錄，調整導入路徑
+# import sys
+# sys.path.append('/path/to/helper')
+# from roi_segmentation_helper import MultiPartROISegmentation
+```
+
+### 外部實踐示例
+
+以下示例展示如何在**用戶自己的項目中**使用這個輔助工具，無需修改 Ultralytics 庫。
 
 #### 示例 1: 網格劃分（規則排列的料件）
 
+**用戶項目文件：`example_pcb_detection.py`**
+
 ```python
+# 導入輔助工具（用戶側代碼）
+from roi_segmentation_helper import MultiPartROISegmentation
+
 # 場景：PCB 板檢測，9 個規則排列的元件
 system = MultiPartROISegmentation(
     model_path="sam2.1_b.pt",
@@ -3950,11 +4001,16 @@ system.visualize_results(results, "output_pcb_segmentation.jpg")
 
 #### 示例 2: 自定義 ROI（不規則排列）
 
-```python
-# 場景：從 YOLO 檢測器獲得料件位置
-from ultralytics import YOLO
+**用戶項目文件：`example_yolo_sam2_pipeline.py`**
 
-# 步驟 1: 使用 YOLO 檢測料件位置
+```python
+# 導入必要的庫（用戶側代碼）
+from roi_segmentation_helper import MultiPartROISegmentation
+from ultralytics import YOLO
+import numpy as np
+
+# 場景：從 YOLO 檢測器獲得料件位置
+# 步驟 1: 使用 YOLO 檢測料件位置（Ultralytics 提供的功能）
 detector = YOLO("yolov8n.pt")
 detect_results = detector("factory_image.jpg")
 
@@ -3962,7 +4018,7 @@ detect_results = detector("factory_image.jpg")
 detected_boxes = detect_results[0].boxes.xyxy.cpu().numpy().astype(int).tolist()
 print(f"Detected {len(detected_boxes)} parts")
 
-# 步驟 2: 使用 SAM2 對每個料件進行精確分割
+# 步驟 2: 使用 SAM2 對每個料件進行精確分割（使用我們的輔助工具）
 system = MultiPartROISegmentation(model_path="sam2.1_b.pt", imgsz=1024)
 system.set_image("factory_image.jpg")
 system.set_custom_rois(detected_boxes)
@@ -3982,7 +4038,12 @@ for result in results:
 
 #### 示例 3: 混合提示（部分自動 + 部分手動）
 
+**用戶項目文件：`example_mixed_prompts.py`**
+
 ```python
+# 導入輔助工具（用戶側代碼）
+from roi_segmentation_helper import MultiPartROISegmentation
+
 # 場景：大部分料件可以自動分割，少數需要手動提示
 system = MultiPartROISegmentation(model_path="sam2.1_b.pt", imgsz=1024)
 system.set_image("complex_scene.jpg")
@@ -4006,9 +4067,13 @@ results = system.segment_all_rois(
 final_mask = system.merge_results(results)
 ```
 
-### ROI 工作流程的關鍵技術點
+### ROI 工作流程的關鍵技術點（外部實踐）
 
-#### 1. 坐標系轉換
+以下技術點和輔助函數可以添加到你的 `roi_segmentation_helper.py` 或單獨的工具文件中。
+
+#### 1. 坐標系轉換（用戶側輔助函數）
+
+**將以下函數添加到你的輔助文件中：**
 
 ```python
 # 全圖坐標 → ROI 坐標
@@ -4044,9 +4109,11 @@ def roi_to_global(roi_point, roi_bbox):
     return (x_global, y_global)
 ```
 
-#### 2. ROI 重疊處理
+#### 2. ROI 重疊處理（用戶側輔助函數）
 
-當 ROI 之間有重疊區域時，可能出現同一物件被多次分割。處理策略：
+當 ROI 之間有重疊區域時，可能出現同一物件被多次分割。
+
+**將以下函數添加到你的輔助文件中：**
 
 ```python
 def handle_overlapping_masks(masks: List[np.ndarray], strategy: str = "nms"):
@@ -4132,6 +4199,23 @@ for frame in part_B_frames:
 - ⭐ **推薦**：使用 ROI 裁剪 + imgsz=1024 作為默認配置
 
 ### 總結與最佳實踐
+
+#### 外部實踐要點
+
+**關鍵提醒**：
+- ✅ 本章節所有代碼都是**用戶側的外部實踐**
+- ✅ **不需要修改** Ultralytics 庫源代碼
+- ✅ 將 `MultiPartROISegmentation` 類和輔助函數保存為你自己的工具文件
+- ✅ 在你的項目中導入使用即可
+
+**項目結構建議**：
+```
+your_project/
+├── roi_segmentation_helper.py    # 保存 MultiPartROISegmentation 類
+├── example_pcb_detection.py       # 你的應用代碼（示例1）
+├── example_yolo_sam2_pipeline.py  # 你的應用代碼（示例2）
+└── example_mixed_prompts.py       # 你的應用代碼（示例3）
+```
 
 #### 影像尺寸設定
 
