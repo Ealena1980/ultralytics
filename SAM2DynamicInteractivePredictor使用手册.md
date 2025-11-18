@@ -1082,6 +1082,614 @@ results = predictor(source="image2.jpg")
 
 ---
 
+## 使用 Mask 進行標註的完整指南
+
+### Mask 提示的核心概念
+
+**Mask 提示** 是 SAM2 支持的一種強大的標註方式，允許你直接提供一個粗略的 mask 區域，讓 SAM2 精煉它。
+
+**與其他提示類型的區別**：
+- **Points/BBoxes**：提供**位置信息**，SAM2 從零開始生成 mask
+- **Mask**：提供**已有的分割結果**，SAM2 進行**精煉和改進**
+
+**典型應用場景**：
+1. **迭代精煉**：從上一次的預測結果開始，逐步改進
+2. **低質量 mask 修正**：使用其他工具（如傳統閾值分割）生成的粗略 mask 作為起點
+3. **跨幀傳播**：將前一幀的 mask 作為當前幀的初始提示
+4. **用戶繪製 mask**：用戶通過繪圖工具創建粗略 mask，SAM2 自動精煉
+
+### Mask 的格式要求
+
+**來自源碼分析**（`predict.py:319-324`）：
+
+```python
+# Mask 預處理流程
+if masks is not None:
+    masks = np.asarray(masks, dtype=np.uint8)  # 轉換為 uint8
+    masks = masks[None] if masks.ndim == 2 else masks  # 確保 3D
+    # 使用 LetterBox 調整大小（最近鄰插值）
+    letterbox = LetterBox(dst_shape, auto=False, center=False,
+                          padding_value=0, interpolation=cv2.INTER_NEAREST)
+    masks = np.stack([letterbox(image=x).squeeze() for x in masks], axis=0)
+    masks = torch.tensor(masks, dtype=self.torch_dtype, device=self.device)
+```
+
+**格式要求總結**：
+
+| 屬性 | 要求 | 說明 |
+|------|------|------|
+| **數據類型** | `np.uint8` 或 `np.float32` | 會自動轉換為 uint8 |
+| **值範圍** | `0` 或 `1`（二值化） | 0=背景，1=前景 |
+| **形狀** | `(H, W)` 或 `(N, H, W)` | 單個 mask 或 N 個 masks |
+| **尺寸** | **原始影像尺寸** | 會自動調整到 imgsz |
+| **坐標系** | 原始影像坐標系 | 與 points/bboxes 一致 |
+
+### Mask 與 update_memory 的配合
+
+#### 基本用法：使用 Mask 更新 Memory Bank
+
+**場景**：你已經有一個粗略的 mask（例如從閾值分割得到），想要 SAM2 精煉它並添加到 Memory Bank。
+
+```python
+import cv2
+import numpy as np
+from ultralytics import SAM2DynamicInteractivePredictor
+
+# 初始化
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+
+# 方法 1: 從其他工具獲得粗略 mask
+image = cv2.imread("image.jpg")
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+_, rough_mask = cv2.threshold(gray, 127, 1, cv2.THRESH_BINARY)  # 值為 0 或 1
+
+# 使用 mask 提示進行精煉並更新 memory
+results = predictor(
+    source="image.jpg",
+    masks=[rough_mask],  # 注意：是 list
+    obj_ids=[0],
+    update_memory=True   # 添加到 Memory Bank
+)
+
+# 獲得精煉後的 mask
+refined_mask = results[0].masks.data[0].cpu().numpy()
+print(f"Mask 形狀: {refined_mask.shape}")
+print(f"Memory Bank 大小: {len(predictor.memory_bank)}")
+```
+
+**關鍵點**：
+- ✅ `masks` 參數接受 **list of arrays**，即使只有一個 mask 也要用 `[mask]`
+- ✅ Mask 尺寸應該是**原始影像尺寸**（不是 imgsz）
+- ✅ 必須提供 `obj_ids` 來標識物件
+- ✅ 可以與 `update_memory=True` 配合使用
+
+#### 進階用法：Mask 結合 Points 進行精煉
+
+**場景**：你有一個粗略 mask，但某些區域不準確，想用 points 進一步指導。
+
+```python
+import numpy as np
+
+# 創建粗略 mask（例如從前一幀預測得到）
+h, w = 1080, 1920
+rough_mask = np.zeros((h, w), dtype=np.uint8)
+rough_mask[300:700, 500:1200] = 1  # 粗略矩形區域
+
+# 使用 mask + points 精煉
+results = predictor(
+    source="current_frame.jpg",
+    masks=[rough_mask],
+    points=[[[800, 500], [600, 650]]],  # 添加精煉點
+    labels=[[1, 0]],  # 第一個點是前景，第二個是背景（修正邊界）
+    obj_ids=[0],
+    update_memory=True
+)
+
+# SAM2 會：
+# 1. 以 rough_mask 為基礎
+# 2. 根據 points 調整邊界
+# 3. 生成精煉後的 mask
+refined_mask = results[0].masks.data[0].cpu().numpy()
+```
+
+**工作原理**（來自源碼 `predict.py:1781-1787`）：
+
+```python
+# 當同時提供 masks 和 points 時
+if points is None:  # 如果只有 mask，沒有 points
+    # 創建空的 placeholder points
+    points = torch.zeros((len(obj_ids), 0, 2), ...)
+    labels = torch.zeros((len(obj_ids), 0), ...)
+
+# Mask 和 points 都會被傳遞給 update_memory
+self.update_memory(obj_ids, points, labels, masks)
+```
+
+### Mask 與 predict（無 update_memory）的使用
+
+#### 場景：使用 Mask 進行單次精煉
+
+**不更新 Memory Bank**，只是獲得精煉後的 mask。
+
+```python
+# 獲得粗略 mask
+rough_mask = np.zeros((1080, 1920), dtype=np.uint8)
+rough_mask[200:800, 300:1000] = 1
+
+# 僅進行精煉，不更新 memory
+results = predictor(
+    source="image.jpg",
+    masks=[rough_mask],
+    obj_ids=[0],
+    update_memory=False  # 僅推理
+)
+
+refined_mask = results[0].masks.data[0].cpu().numpy()
+
+# Memory Bank 大小不變
+print(f"Memory Bank 大小: {len(predictor.memory_bank)}")  # 保持不變
+```
+
+**使用場景**：
+- ✅ 快速實驗不同的 mask 提示
+- ✅ 批量處理大量影像（不需要時序記憶）
+- ✅ 單純的 mask 精煉工具（非視頻追蹤）
+
+### 多物件 Mask 標註
+
+#### 同時提供多個物件的 Mask
+
+```python
+import numpy as np
+
+# 創建 2 個物件的 masks
+h, w = 1080, 1920
+mask_obj0 = np.zeros((h, w), dtype=np.uint8)
+mask_obj0[100:400, 100:500] = 1  # 物件 0
+
+mask_obj1 = np.zeros((h, w), dtype=np.uint8)
+mask_obj1[500:900, 800:1400] = 1  # 物件 1
+
+# 一次性更新兩個物件
+results = predictor(
+    source="image.jpg",
+    masks=[mask_obj0, mask_obj1],  # 2 個 masks
+    obj_ids=[0, 1],                 # 對應的物件 IDs
+    update_memory=True
+)
+
+# 結果
+print(f"Memory Bank 大小: {len(predictor.memory_bank)}")  # 1（一個 frame）
+print(f"追蹤的物件: {predictor.obj_idx_set}")  # {0, 1}
+
+# 獲得每個物件的精煉 mask
+refined_mask_0 = results[0].masks.data[0].cpu().numpy()
+refined_mask_1 = results[0].masks.data[1].cpu().numpy()
+```
+
+**關鍵發現**（來自源碼 `predict.py:1784-1786`）：
+
+```python
+# masks 和 obj_ids 必須長度相同
+if masks is not None:
+    assert len(masks) == len(obj_ids), "masks and obj_ids must have the same length."
+```
+
+### 實際應用場景
+
+#### 場景 1: 迭代精煉工作流
+
+**問題**：第一次預測的 mask 不夠精確，想在此基礎上繼續調整。
+
+```python
+from ultralytics import SAM2DynamicInteractivePredictor
+import numpy as np
+
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+
+# 第 1 次：使用 point 獲得初始 mask
+results_v1 = predictor(
+    source="image.jpg",
+    points=[[[500, 500]]],  # 粗略點擊物件中心
+    labels=[[1]],
+    obj_ids=[0],
+    update_memory=True
+)
+mask_v1 = results_v1[0].masks.data[0].cpu().numpy()
+
+# 檢查 v1 結果，發現邊界不準確
+# 第 2 次：使用 v1 mask + 額外 points 精煉
+predictor.memory_bank.pop()  # 移除 v1 的 frame
+
+results_v2 = predictor(
+    source="image.jpg",
+    masks=[mask_v1],  # 使用 v1 作為基礎
+    points=[[[600, 600], [450, 450]]],  # 添加邊界修正點
+    labels=[[1, 0]],  # 前景 + 背景
+    obj_ids=[0],
+    update_memory=True
+)
+mask_v2 = results_v2[0].masks.data[0].cpu().numpy()
+
+# mask_v2 是精煉後的最終結果
+```
+
+#### 場景 2: 跨幀 Mask 傳播
+
+**問題**：視頻中物件在相鄰幀之間變化不大，想用前一幀的 mask 作為當前幀的初始提示。
+
+```python
+import cv2
+
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+cap = cv2.VideoCapture("video.mp4")
+
+# Frame 0: 手動標註
+ret, frame0 = cap.read()
+results_f0 = predictor(
+    source=frame0,
+    points=[[[640, 360]]],  # 初始點擊
+    labels=[[1]],
+    obj_ids=[0],
+    update_memory=True
+)
+mask_f0 = results_f0[0].masks.data[0].cpu().numpy()
+
+# Frame 1-N: 使用前一幀的 mask 作為提示
+for frame_idx in range(1, 100):
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    # 使用前一幀的 mask 作為當前幀的提示
+    results = predictor(
+        source=frame,
+        masks=[mask_f0],  # 前一幀的 mask
+        obj_ids=[0],
+        update_memory=True
+    )
+
+    # 更新 mask 為當前幀的結果（用於下一幀）
+    mask_f0 = results[0].masks.data[0].cpu().numpy()
+
+    print(f"Frame {frame_idx} processed, Memory Bank size: {len(predictor.memory_bank)}")
+
+cap.release()
+```
+
+**優勢**：
+- ✅ 比純 SAM2 自動追蹤更穩定（有 mask 引導）
+- ✅ 可以處理大幅度運動（mask 提供了形狀先驗）
+- ✅ 減少累積誤差（每幀都有明確的 mask 輸入）
+
+#### 場景 3: 結合傳統分割方法
+
+**問題**：使用簡單的閾值或 GrabCut 生成粗略 mask，用 SAM2 精煉。
+
+```python
+import cv2
+import numpy as np
+
+# 讀取影像
+image = cv2.imread("image.jpg")
+gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+# 方法 A: 簡單閾值分割
+_, threshold_mask = cv2.threshold(gray, 100, 1, cv2.THRESH_BINARY)
+
+# 方法 B: GrabCut
+mask_grabcut = np.zeros(image.shape[:2], np.uint8)
+bgd_model = np.zeros((1, 65), np.float64)
+fgd_model = np.zeros((1, 65), np.float64)
+rect = (100, 100, 500, 400)
+cv2.grabCut(image, mask_grabcut, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+mask_grabcut = np.where((mask_grabcut == 2) | (mask_grabcut == 0), 0, 1).astype('uint8')
+
+# 使用 SAM2 精煉
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+
+# 精煉閾值 mask
+results_threshold = predictor(
+    source=image,
+    masks=[threshold_mask],
+    obj_ids=[0],
+    update_memory=False  # 僅精煉，不更新 memory
+)
+
+# 精煉 GrabCut mask
+results_grabcut = predictor(
+    source=image,
+    masks=[mask_grabcut],
+    obj_ids=[0],
+    update_memory=False
+)
+
+# 對比結果
+refined_threshold = results_threshold[0].masks.data[0].cpu().numpy()
+refined_grabcut = results_grabcut[0].masks.data[0].cpu().numpy()
+
+print("傳統方法 + SAM2 精煉的混合流程完成")
+```
+
+#### 場景 4: 用戶交互式標註工具
+
+**問題**：構建一個工具，用戶繪製粗略 mask，SAM2 自動精煉。
+
+```python
+import cv2
+import numpy as np
+from ultralytics import SAM2DynamicInteractivePredictor
+
+class InteractiveMaskTool:
+    def __init__(self, image_path, model="sam2.1_b.pt"):
+        self.image = cv2.imread(image_path)
+        self.h, self.w = self.image.shape[:2]
+        self.user_mask = np.zeros((self.h, self.w), dtype=np.uint8)
+        self.predictor = SAM2DynamicInteractivePredictor(model=model)
+        self.drawing = False
+
+    def mouse_callback(self, event, x, y, flags, param):
+        """滑鼠事件：繪製粗略 mask"""
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.drawing = True
+        elif event == cv2.EVENT_MOUSEMOVE and self.drawing:
+            cv2.circle(self.user_mask, (x, y), 20, 1, -1)  # 繪製粗略區域
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.drawing = False
+
+    def run(self):
+        """運行交互式工具"""
+        cv2.namedWindow("Draw Mask (Press R to refine, Q to quit)")
+        cv2.setMouseCallback("Draw Mask (Press R to refine, Q to quit)", self.mouse_callback)
+
+        while True:
+            # 顯示用戶繪製的 mask
+            overlay = self.image.copy()
+            overlay[self.user_mask > 0] = [0, 255, 0]
+            display = cv2.addWeighted(self.image, 0.7, overlay, 0.3, 0)
+            cv2.imshow("Draw Mask (Press R to refine, Q to quit)", display)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('r'):  # 按 'R' 精煉
+                print("使用 SAM2 精煉中...")
+                results = self.predictor(
+                    source=self.image,
+                    masks=[self.user_mask],
+                    obj_ids=[0],
+                    update_memory=False
+                )
+                refined_mask = results[0].masks.data[0].cpu().numpy()
+
+                # 將精煉後的 mask 設為新的 user_mask
+                self.user_mask = refined_mask.astype(np.uint8)
+                print("精煉完成！")
+
+            elif key == ord('q'):  # 按 'Q' 退出
+                break
+
+        cv2.destroyAllWindows()
+        return self.user_mask
+
+# 使用
+tool = InteractiveMaskTool("image.jpg")
+final_mask = tool.run()
+np.save("final_mask.npy", final_mask)
+```
+
+### Mask 的高級技巧
+
+#### 技巧 1: Mask 的預處理
+
+```python
+import cv2
+import numpy as np
+
+def preprocess_mask(rough_mask, kernel_size=5):
+    """預處理粗略 mask，提高 SAM2 精煉效果"""
+    # 1. 形態學操作去除噪聲
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    mask = cv2.morphologyEx(rough_mask, cv2.MORPH_OPEN, kernel)  # 去除小噪點
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)  # 填充小孔洞
+
+    # 2. 確保二值化
+    mask = (mask > 0).astype(np.uint8)
+
+    # 3. 移除太小的連通區域
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    min_area = 100  # 最小區域面積
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] < min_area:
+            mask[labels == i] = 0
+
+    return mask
+
+# 使用
+rough_mask = ...  # 你的粗略 mask
+clean_mask = preprocess_mask(rough_mask)
+
+results = predictor(
+    source="image.jpg",
+    masks=[clean_mask],
+    obj_ids=[0],
+    update_memory=True
+)
+```
+
+#### 技巧 2: Mask 質量檢查
+
+```python
+def check_mask_quality(mask):
+    """檢查 mask 質量，給出建議"""
+    h, w = mask.shape
+    total_pixels = h * w
+    foreground_pixels = np.sum(mask > 0)
+
+    # 計算前景比例
+    fg_ratio = foreground_pixels / total_pixels
+
+    # 計算連通區域數量
+    num_components, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    num_regions = num_components - 1  # 減去背景
+
+    # 給出建議
+    suggestions = []
+    if fg_ratio < 0.01:
+        suggestions.append("⚠️ 前景區域太小（< 1%），考慮增大 mask 區域")
+    elif fg_ratio > 0.9:
+        suggestions.append("⚠️ 前景區域太大（> 90%），可能包含過多背景")
+
+    if num_regions > 10:
+        suggestions.append(f"⚠️ 檢測到 {num_regions} 個分離區域，考慮分別處理")
+    elif num_regions == 0:
+        suggestions.append("❌ Mask 為空！")
+
+    return {
+        "foreground_ratio": fg_ratio,
+        "num_regions": num_regions,
+        "suggestions": suggestions
+    }
+
+# 使用
+quality = check_mask_quality(user_mask)
+print(f"前景比例: {quality['foreground_ratio']:.2%}")
+print(f"連通區域數: {quality['num_regions']}")
+for suggestion in quality['suggestions']:
+    print(suggestion)
+```
+
+#### 技巧 3: Mask 融合策略
+
+**問題**：有多個不同來源的 mask（例如多個模型的預測），如何融合？
+
+```python
+def fuse_masks(mask_list, strategy="vote"):
+    """
+    融合多個 mask
+
+    Args:
+        mask_list: List of masks (np.ndarray)
+        strategy: "vote" (多數投票) | "union" (聯集) | "intersection" (交集)
+
+    Returns:
+        融合後的 mask
+    """
+    stacked = np.stack(mask_list, axis=0)
+
+    if strategy == "vote":
+        # 多數投票：超過一半認為是前景
+        votes = stacked.sum(axis=0)
+        fused = (votes > len(mask_list) / 2).astype(np.uint8)
+
+    elif strategy == "union":
+        # 聯集：任一 mask 認為是前景
+        fused = (stacked.sum(axis=0) > 0).astype(np.uint8)
+
+    elif strategy == "intersection":
+        # 交集：所有 mask 都認為是前景
+        fused = (stacked.sum(axis=0) == len(mask_list)).astype(np.uint8)
+
+    return fused
+
+# 使用
+mask_yolo = ...  # 從 YOLO 得到的 mask
+mask_threshold = ...  # 從閾值得到的 mask
+mask_grabcut = ...  # 從 GrabCut 得到的 mask
+
+# 融合
+fused_mask = fuse_masks([mask_yolo, mask_threshold, mask_grabcut], strategy="vote")
+
+# 用 SAM2 精煉融合後的 mask
+results = predictor(
+    source="image.jpg",
+    masks=[fused_mask],
+    obj_ids=[0],
+    update_memory=True
+)
+```
+
+### Mask 使用的常見錯誤和解決方案
+
+#### 錯誤 1: Mask 尺寸不匹配
+
+```python
+# ❌ 錯誤：mask 尺寸與 imgsz 混淆
+image = cv2.imread("image.jpg")  # 1920×1080
+mask = np.zeros((1024, 1024), dtype=np.uint8)  # 錯誤！應該是 1920×1080
+
+# ✅ 正確：mask 應該是原始影像尺寸
+h, w = image.shape[:2]
+mask = np.zeros((h, w), dtype=np.uint8)  # 1920×1080
+```
+
+#### 錯誤 2: Mask 值不是二值化
+
+```python
+# ❌ 錯誤：mask 值是 0-255
+_, mask = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)  # 值為 0 或 255
+
+# ✅ 正確：轉換為 0 或 1
+mask = (mask > 0).astype(np.uint8)  # 值為 0 或 1
+```
+
+#### 錯誤 3: 忘記使用 list 包裝
+
+```python
+# ❌ 錯誤：直接傳遞 np.ndarray
+predictor(source="image.jpg", masks=mask, ...)  # TypeError!
+
+# ✅ 正確：使用 list
+predictor(source="image.jpg", masks=[mask], ...)  # 正確
+```
+
+#### 錯誤 4: obj_ids 與 masks 長度不匹配
+
+```python
+# ❌ 錯誤
+masks = [mask1, mask2]  # 2 個 masks
+obj_ids = [0]           # 只有 1 個 ID
+
+# ✅ 正確
+masks = [mask1, mask2]  # 2 個 masks
+obj_ids = [0, 1]        # 2 個 IDs
+```
+
+### 總結：Mask 使用最佳實踐
+
+✅ **推薦做法**：
+
+1. **Mask 格式**：
+   - 使用原始影像尺寸
+   - 值為 0 或 1（二值化）
+   - 數據類型 `np.uint8`
+
+2. **與其他提示混用**：
+   - Mask + Points 精煉邊界
+   - Mask 作為基礎，Points 修正細節
+
+3. **迭代工作流**：
+   - 第一次用簡單提示（point/bbox）
+   - 後續用前一次的 mask 迭代精煉
+
+4. **質量控制**：
+   - 預處理 mask（去噪、填孔）
+   - 檢查 mask 質量
+   - 多 mask 融合策略
+
+⚠️ **注意事項**：
+
+1. **坐標系一致**：Mask 應該在原始影像坐標系
+2. **長度匹配**：`len(masks) == len(obj_ids)`
+3. **記憶體管理**：大量 mask 會增加記憶體消耗
+
+❌ **避免**：
+
+1. 使用未經預處理的噪聲 mask
+2. Mask 尺寸與影像不匹配
+3. 值範圍不正確（應該是 0/1，不是 0/255）
+
+---
+
 ## Memory Bank 快照與恢復
 
 ### 使用場景
