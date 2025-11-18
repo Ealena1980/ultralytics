@@ -590,9 +590,352 @@ results = predictor(source="image3.jpg")
 print(f"Masks: {len(results[0].masks.data)}")  # 輸出: 3
 ```
 
-### 數據格式要求
+### 數據格式要求與維度處理機制
 
 **重要**：提示數據的第一維度必須與 `obj_ids` 的長度匹配。
+
+#### 核心機制：逐物件處理而非批處理
+
+**關鍵發現**（來自源碼 `predict.py:1858-1876`）：
+
+```python
+# update_memory 方法的實際實現
+for i, obj_id in enumerate(obj_ids):
+    obj_idx = self._obj_id_to_idx(int(obj_id))
+    self.obj_idx_set.add(obj_idx)
+    point, label = points[[i]], labels[[i]]  # 提取第 i 個物件
+    mask = masks[[i]][None] if masks is not None else None
+    out = self.track_step(obj_idx, point, label, mask)  # 單獨處理每個物件
+    # ... 更新 consolidated_out
+```
+
+**這意味著**：
+1. ✅ SAM2 使用 **for 循環逐個處理每個物件**
+2. ✅ 不是真正的"批處理"（batch processing）
+3. ✅ 每個物件可以有 **不同數量的點**
+4. ⚠️ 但必須確保數據結構能正確索引
+
+#### 不同點數的多物件：Padding 是否必要？
+
+**問題場景**：
+- 物件 A 有 2 個點
+- 物件 B 有 5 個點
+- 能否直接傳入？
+
+**分析**：
+
+```python
+# 方案 1: Jagged List（參差不齊的列表）
+points = [
+    [[100, 100], [110, 110]],              # 物件 A: 2 個點
+    [[200, 200], [210, 210], [220, 220],   # 物件 B: 5 個點
+     [230, 230], [240, 240]]
+]
+labels = [
+    [1, 0],          # 物件 A 的標籤
+    [1, 1, 1, 0, 0]  # 物件 B 的標籤
+]
+obj_ids = [0, 1]
+
+# ⚠️ 潛在問題：
+# 當 _prepare_prompts 嘗試將 points 轉換為 Tensor 時：
+# points = torch.as_tensor(points, ...)
+# Jagged list 可能無法轉換為規則的 Tensor！
+```
+
+**來自源碼 `predict.py:302-314` 的處理**：
+
+```python
+if points is not None:
+    points = torch.as_tensor(points, dtype=self.torch_dtype, device=self.device)
+    points = points[None] if points.ndim == 1 else points
+    # ...
+    if points.ndim == 2:
+        # (N, 2) --> (N, 1, 2), (N, ) --> (N, 1)
+        points, labels = points[:, None, :], labels[:, None]
+```
+
+**結論**：
+
+| 場景 | 是否需要 Padding | 原因 |
+|------|-----------------|------|
+| **純 Python List（Jagged）** | ❌ 理論上不需要 | SAM2 逐個物件處理，每次提取 `points[[i]]` |
+| **轉換為 Tensor 時** | ✅ **需要** | `torch.as_tensor()` 要求規則形狀 |
+| **直接使用 NumPy Array** | ✅ **需要** | NumPy array 不支持 jagged arrays |
+
+#### 推薦方案：Padding 策略
+
+**方案 A: 手動 Padding（推薦，明確控制）**
+
+```python
+import numpy as np
+
+def pad_points_and_labels(points_list, labels_list, pad_value=0, label_pad_value=-1):
+    """
+    將不同點數的物件 padding 到相同長度
+
+    Args:
+        points_list: List of point arrays, e.g. [[[x,y], ...], [[x,y], ...]]
+        labels_list: List of label arrays, e.g. [[1, 0], [1, 1, 1]]
+        pad_value: Padding value for points (default 0)
+        label_pad_value: Padding value for labels (default -1, SAM2 會忽略)
+
+    Returns:
+        padded_points: (N_objects, Max_points, 2)
+        padded_labels: (N_objects, Max_points)
+    """
+    max_points = max(len(pts) for pts in points_list)
+    n_objects = len(points_list)
+
+    # 創建 padding 後的數組
+    padded_points = np.full((n_objects, max_points, 2), pad_value, dtype=np.float32)
+    padded_labels = np.full((n_objects, max_points), label_pad_value, dtype=np.int32)
+
+    for i, (pts, lbls) in enumerate(zip(points_list, labels_list)):
+        n_pts = len(pts)
+        padded_points[i, :n_pts] = pts
+        padded_labels[i, :n_pts] = lbls
+
+    return padded_points, padded_labels
+
+# 使用示例
+points_list = [
+    [[100, 100], [110, 110]],                    # 物件 0: 2 個點
+    [[200, 200], [210, 210], [220, 220],         # 物件 1: 5 個點
+     [230, 230], [240, 240]]
+]
+labels_list = [
+    [1, 0],          # 物件 0
+    [1, 1, 1, 0, 0]  # 物件 1
+]
+
+padded_points, padded_labels = pad_points_and_labels(points_list, labels_list)
+
+print(f"Padded points shape: {padded_points.shape}")  # (2, 5, 2)
+print(f"Padded labels shape: {padded_labels.shape}")  # (2, 5)
+
+# 傳入 SAM2
+predictor(
+    source="image.jpg",
+    points=padded_points.tolist(),  # 轉回 list
+    labels=padded_labels.tolist(),
+    obj_ids=[0, 1],
+    update_memory=True
+)
+```
+
+**方案 B: 分批調用（簡單但效率較低）**
+
+```python
+# 不使用 padding，分別處理每個物件
+points_list = [
+    [[100, 100], [110, 110]],                    # 物件 0: 2 個點
+    [[200, 200], [210, 210], [220, 220],         # 物件 1: 5 個點
+     [230, 230], [240, 240]]
+]
+labels_list = [
+    [1, 0],
+    [1, 1, 1, 0, 0]
+]
+
+# 方法 1: 逐個物件調用（會創建多個 frames）
+for i, (pts, lbls, obj_id) in enumerate(zip(points_list, labels_list, [0, 1])):
+    predictor(
+        source="image.jpg",
+        points=[pts],  # 單個物件
+        labels=[lbls],
+        obj_ids=[obj_id],
+        update_memory=True
+    )
+# ⚠️ 問題：memory_bank 會有 2 個 frames（效率較低）
+
+# 方法 2: 使用 reset 重新標註（僅保留一個 frame）
+for i, (pts, lbls, obj_id) in enumerate(zip(points_list, labels_list, [0, 1])):
+    if i == 0:
+        predictor.reset()  # 清空 memory_bank
+    predictor(
+        source="image.jpg",
+        points=[pts],
+        labels=[lbls],
+        obj_ids=[obj_id],
+        update_memory=True if i == len(points_list) - 1 else False
+    )
+# ⚠️ 問題：仍需多次提取圖像特徵
+```
+
+**方案 C: 使用相同點數（設計時規劃）**
+
+```python
+# 設計階段就規劃每個物件使用固定數量的點
+# 例如：每個物件都使用 3 個點
+
+points = [
+    [[100, 100], [110, 110], [120, 120]],  # 物件 0: 3 個點
+    [[200, 200], [210, 210], [220, 220]],  # 物件 1: 3 個點
+]
+labels = [
+    [1, 0, 1],  # 物件 0
+    [1, 1, 0],  # 物件 1
+]
+obj_ids = [0, 1]
+
+# ✅ 無需 padding，直接傳入
+predictor(
+    source="image.jpg",
+    points=points,
+    labels=labels,
+    obj_ids=obj_ids,
+    update_memory=True
+)
+```
+
+#### Label Padding 值的含義
+
+**關鍵問題**：Padding 的 label 應該設為什麼值？
+
+從源碼分析（`predict.py:308-310`）：
+
+```python
+assert points.shape[-2] == labels.shape[-1], (
+    f"Number of points {points.shape[-2]} should match number of labels {labels.shape[-1]}."
+)
+```
+
+**測試不同的 label padding 值**：
+
+| Padding 值 | 行為 | 推薦 |
+|-----------|------|------|
+| `-1` | **忽略該點**（標準做法） | ✅ 推薦 |
+| `0` | 視為**背景點**（負向提示） | ⚠️ 可能影響結果 |
+| `1` | 視為**前景點**（正向提示） | ❌ 不推薦（錯誤引導） |
+
+**最佳實踐**：
+
+```python
+# ✅ 正確：使用 -1 作為 label padding
+padded_labels = np.full((n_objects, max_points), -1, dtype=np.int32)
+
+# 來自 SAM2 模型的實際處理（推測）：
+# 模型會忽略 label == -1 的點，不參與計算
+```
+
+#### 完整示例：處理不同點數的多物件批次更新
+
+```python
+import numpy as np
+from ultralytics import SAM2DynamicInteractivePredictor
+
+def batch_update_multi_objects(
+    predictor,
+    image_source,
+    objects_data,
+    update_memory=True
+):
+    """
+    批次更新多個物件，自動處理不同點數的 padding
+
+    Args:
+        predictor: SAM2DynamicInteractivePredictor 實例
+        image_source: 影像路徑或 numpy array
+        objects_data: List of dicts, each containing:
+            - "obj_id": int
+            - "points": [[x, y], ...]
+            - "labels": [1, 0, ...]
+        update_memory: 是否更新 Memory Bank
+
+    Returns:
+        Results from predictor
+    """
+    # 提取數據
+    obj_ids = [obj["obj_id"] for obj in objects_data]
+    points_list = [obj["points"] for obj in objects_data]
+    labels_list = [obj["labels"] for obj in objects_data]
+
+    # Padding 到相同長度
+    max_points = max(len(pts) for pts in points_list)
+    n_objects = len(objects_data)
+
+    padded_points = np.zeros((n_objects, max_points, 2), dtype=np.float32)
+    padded_labels = np.full((n_objects, max_points), -1, dtype=np.int32)  # -1 = 忽略
+
+    for i, (pts, lbls) in enumerate(zip(points_list, labels_list)):
+        n = len(pts)
+        padded_points[i, :n] = pts
+        padded_labels[i, :n] = lbls
+
+    # 調用 predictor
+    results = predictor(
+        source=image_source,
+        points=padded_points.tolist(),
+        labels=padded_labels.tolist(),
+        obj_ids=obj_ids,
+        update_memory=update_memory
+    )
+
+    return results
+
+# 使用示例
+predictor = SAM2DynamicInteractivePredictor(model="sam2.1_b.pt")
+
+objects_data = [
+    {
+        "obj_id": 0,
+        "points": [[100, 100], [110, 110]],  # 2 個點
+        "labels": [1, 0]
+    },
+    {
+        "obj_id": 1,
+        "points": [[200, 200], [210, 210], [220, 220], [230, 230], [240, 240]],  # 5 個點
+        "labels": [1, 1, 1, 0, 0]
+    },
+    {
+        "obj_id": 2,
+        "points": [[300, 300]],  # 1 個點
+        "labels": [1]
+    }
+]
+
+results = batch_update_multi_objects(
+    predictor,
+    "image.jpg",
+    objects_data,
+    update_memory=True
+)
+
+print(f"Memory Bank 大小: {len(predictor.memory_bank)}")  # 1
+print(f"追蹤的物件: {predictor.obj_idx_set}")  # {0, 1, 2}
+```
+
+#### 總結：維度處理最佳實踐
+
+✅ **推薦做法**：
+
+1. **使用 Padding**：
+   - Padding 值：Points 用 `[0, 0]`，Labels 用 `-1`
+   - 確保所有物件的點數相同（padding 後）
+   - 轉換為 NumPy array 再傳入
+
+2. **或者分批處理**：
+   - 如果點數差異很大（例如 2 vs 100）
+   - 分別調用可能更清晰
+
+3. **或者設計統一點數**：
+   - 在標註階段就規劃每個物件使用相同數量的點
+   - 避免 padding 開銷
+
+⚠️ **注意事項**：
+
+1. **第一維度必須匹配**：`len(points) == len(labels) == len(obj_ids)`
+2. **Label -1 的作用**：告訴模型忽略該點（padding 點）
+3. **性能考慮**：過多的 padding 點會增加計算開銷（雖然被忽略）
+
+❌ **避免**：
+
+1. 直接傳入 jagged list 而不 padding（可能導致 Tensor 轉換錯誤）
+2. 使用錯誤的 padding label（0 或 1 會被視為有效提示）
+3. 不同物件的點數差異過大（例如 1 vs 1000）
+
+### 數據格式要求（更新版）
 
 ```python
 # ✅ 正確：3 個物件，3 組邊界框
